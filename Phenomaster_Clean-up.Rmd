@@ -1,0 +1,397 @@
+---
+title: "EC22_011_SPF"
+author: "ECB"
+date: "April 21, 2022"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+
+
+```{r setup, message=FALSE, warning=FALSE}
+## Required packages
+rm(list=ls())
+library("dplyr")
+library("ggplot2")
+library("ggfortify")
+library("tidyr")
+library("readr")
+library("lubridate")
+library("DescTools")
+library("knitr")
+
+```
+
+UPDATE: Tidying up data from TSE Phenomaster output file
+```{r Tidying, message=FALSE, warning=FALSE}
+
+##reading file
+TSE.data <- read_delim("C:/Users/jens_/OneDrive/Dokumente/Master/Master Thesis/Experiments/JS22 009/Data/JS22_009_WT-SPF.csv", 
+                      delim = ";",
+                      col_names = TRUE, 
+                      col_types = cols(
+                          Date = col_date(format = "%d.%m.%Y"),
+                          Time = col_time(format = "%H:%M"),
+                          Box = col_factor(levels=NULL, ordered = FALSE)
+                      ),
+                      locale = locale(decimal_mark = ".")
+                      )
+##sort by Box, Date and time
+TSE.data <- TSE.data %>%
+  arrange(Box,Date,Time)
+
+```
+
+
+Creating extra time variables
+```{r Time variables, message=FALSE}
+
+TSE.data <- TSE.data %>%
+  ##add zeitgeber time
+  mutate(zt = as.numeric(case_when(Time < dhours(6) ~ Time + dhours(18),
+                        Time >= dhours(6) ~ Time - dhours(6)))) %>%
+  ##format zt in hours
+  mutate(zt = zt/3600) %>%
+  ##create actual datetime
+  mutate(datetime = as.POSIXct(paste(Date,Time), format = "%Y-%m-%d %H:%M:%S")) %>% 
+  ##create dummy zt datetime for day number
+  mutate(zt_datetime = datetime - dhours(6)) %>% 
+  ##timepoint since experiment started
+  mutate(timepoint_h = as.numeric(datetime - first(datetime))/3600) %>% 
+  ##day number based in zt 
+  mutate(day.num = as.numeric(date(zt_datetime) - date(first(zt_datetime)))) %>%
+  ###timepoint since start of day 1. weirdly, the standard unit was minutes, but it works I guess
+  mutate(timepoint_clean_h = as.numeric(datetime - as.POSIXct(paste(first(Date[which(day.num == 1)]),"06:00:00"), format = "%Y-%m-%d %H:%M:%S"))/60)
+```  
+
+Creating new gas exchange variables (UPDATE!! Forgot export Ref cage measurements, used empty box as reference Box4)
+```{r Gas Exchange, message=FALSE}
+
+TSE.data <- TSE.data %>%
+  mutate(
+    Flow_ml_h = Flow * 1000 * 60,
+    N2Ref = 100 - (Ref.O2 + Ref.CO2),
+    N2Box = 100 - (O2 + CO2),
+    
+  )
+```
+ 
+Recalculating VO2, VCO2, EE, RER without body weight
+```{r EE without BW, message=FALSE}
+
+TSE.data <- TSE.data %>%
+  mutate(
+    VO2_no_BW = Flow_ml_h * (((Ref.O2*N2Box)-(O2*N2Ref))/(N2Ref*100)),
+    VCO2_no_BW = Flow_ml_h * (((CO2*N2Ref)-(Ref.CO2*N2Box))/(N2Ref*100))
+  ) %>%
+  mutate(
+    EE_no_BW = ((3.941*VO2_no_BW)+(1.106*VCO2_no_BW))/1000, #change ml/h to L/h 
+    RER_no_BW = VCO2_no_BW / VO2_no_BW
+  )
+```
+
+Calculating Cumulative and Daily Drink and Feed
+```{r Cumulative Drink and Feed, message=FALSE}
+
+TSE.data <- TSE.data %>%
+  group_by(Box) %>%
+  mutate(
+    Cum.Drink = cumsum(Drink),
+    Cum.Feed = cumsum(Feed)
+  )
+
+TSE.data <- TSE.data %>%
+  group_by(Box, day.num) %>%
+  mutate(
+    daily.Drink = sum(Drink),
+    daily.Feed = sum(Feed)
+  )
+
+```
+
+Creating plots for exploring data
+```{r Exploratory graphs}
+###creating list of variables to be plotted against timepoint_clean_h
+plot.names <- c("daily.Feed","daily.Drink", "Cum.Feed", "Cum.Drink", "VO2_no_BW", "VCO2_no_BW", "EE_no_BW", "RER_no_BW")
+
+###making point, line plots
+for(i in 1:2){print(
+  ggplot(data = TSE.data, aes(x = timepoint_clean_h, y = get(plot.names[i]), col = Box)) 
+  + ylab(plot.names[i]) 
+  + geom_point(size = 0.5) 
+  + theme_bw())}
+
+for(i in 3:8){print(
+  ggplot(data = TSE.data, aes(x = timepoint_clean_h, y = get(plot.names[i]), col = Box)) 
+  + ylab(plot.names[i]) 
+  + geom_line(size = 0.5) 
+  + theme_bw())}
+
+```
+
+Cleaning up dataset
+```{r}
+
+## Identify missing values
+colSums(is.na(TSE.data)) 
+TSE.data %>% count(Box)
+
+###Option to Check temporal distribution of Feed, Drink = 0.01 to evaluate whether the high frequency of these values is an artifact or not
+#(ftable(TSE.data$Feed))
+#View(ftable(TSE.data$Drink))
+ggplot(data = TSE.data[which(TSE.data$Feed == 0.01),], aes(x = zt)) + geom_histogram(binwidth = 0.5) + ylab("counts of Feed = 0.01")
+ggplot(data = TSE.data[which(TSE.data$Drink == 0.01),], aes(x = zt)) + geom_histogram(binwidth = 0.5) + ylab("counts of Drink = 0.01")
+###doing this with the master dataset revealed no pattern for Feed, but a separation in frequency between day/night for Drink
+
+##Most missing values comming from RER and RER_no_BW because of 0 cannot by divided
+
+## Checking patterns in extreme values 
+###h2 cleanup removed; two-step filtering of dO2 and dCO2: 1) filter out non-positive values, 2)using upper/lower quartile +/- 1.5 IQR rule to identify low outliers. For Food/Drink: 1) filter out values < 0.02, 2) IQR. Also, negative Feed/Drink values
+"Subsetting extreme low VO2 or CO2 values (open cages during sampling)"
+for(i in 1:8){
+cutoff.dO2 <- as.numeric(quantile(TSE.data$dO2[which(TSE.data$Box == i & TSE.data$dO2 > 0)], 0.25, na.rm = TRUE) - (1.5*IQR(TSE.data$dO2[which(TSE.data$Box == i & TSE.data$dO2>0)], na.rm = TRUE)))
+cutoff.dCO2 <- as.numeric(quantile(TSE.data$dCO2[which(TSE.data$Box == i & TSE.data$dCO2> 0)], 0.25, na.rm = TRUE) - (1.5*IQR(TSE.data$dCO2[which(TSE.data$Box == i & TSE.data$dCO2 > 0)], na.rm = TRUE)))
+
+dplyr::select(TSE.data[which(TSE.data$Box == i),], Date, datetime, Box, dO2, dCO2, RER) %>%
+  filter(dO2 <= 0 | dCO2 <= 0 | dO2 < cutoff.dO2 | dCO2 < cutoff.dO2)} %>%
+  print(count(Date))
+"Subsetting high Drink, Feed values (drips during sampling)"
+for(i in 1:8){
+cutoff.Feed <- as.numeric(quantile(TSE.data$Feed[which(TSE.data$Box == i & TSE.data$Feed > 0.01)], 0.75, na.rm = TRUE) + (1.5*IQR(TSE.data$Feed[which(TSE.data$Box == i & TSE.data$Feed > 0.01)], na.rm = TRUE)))
+cutoff.Drink <- as.numeric(quantile(TSE.data$Drink[which(TSE.data$Box == i & TSE.data$Drink > 0)], 0.75, na.rm = TRUE) + (1.5*IQR(TSE.data$Drink[which(TSE.data$Box == i & TSE.data$Drink > 0)], na.rm = TRUE)))  
+  
+dplyr::select(TSE.data[which(TSE.data$Box == i),], datetime, Box, Drink, Feed) %>%
+  filter(Feed < 0 | Drink < 0 | Feed > cutoff.Feed | Drink > cutoff.Drink)} %>%
+  print(count())
+```
+
+
+UPDATE: Subsetting to exclude values and recalculating Cumulative variables
+
+```{r, message=FALSE}
+###clean for Box 1
+###Setting cutoff values. This is necessary since using the formula directly in the filter function will not perform correct filtering for some reason
+cutoff.Feed <- as.numeric(quantile(TSE.data$Feed[which(TSE.data$Box == 1 & TSE.data$Feed > 0.01)], 0.75, na.rm = TRUE) + (1.5*IQR(TSE.data$Feed[which(TSE.data$Box == 1 & TSE.data$Feed > 0.01)], na.rm = TRUE)))
+cutoff.Drink <- as.numeric(quantile(TSE.data$Drink[which(TSE.data$Box == 1 & TSE.data$Drink > 0)], 0.75, na.rm = TRUE) + (1.5*IQR(TSE.data$Drink[which(TSE.data$Box == 1 & TSE.data$Drink > 0)], na.rm = TRUE)))
+cutoff.dO2 <- as.numeric(quantile(TSE.data$dO2[which(TSE.data$Box == 1 & TSE.data$dO2 > 0)], 0.25, na.rm = TRUE) - (1.5*IQR(TSE.data$dO2[which(TSE.data$Box == 1 & TSE.data$dO2>0)], na.rm = TRUE)))
+cutoff.dCO2 <- as.numeric(quantile(TSE.data$dCO2[which(TSE.data$Box == 1 & TSE.data$dCO2> 0)], 0.25, na.rm = TRUE) - (1.5*IQR(TSE.data$dCO2[which(TSE.data$Box == 1 & TSE.data$dCO2 > 0)], na.rm = TRUE)))
+"Sub9setting extreme low VO2 or CO2 values (open cages during sampling)"
+TSE.data.clean <- TSE.data[which(TSE.data$Box == 1),] %>%
+  filter(dO2 > 0 & dCO2 > 0 &
+    dO2 >= cutoff.dO2 & dCO2 >= cutoff.dCO2)
+##Negative R.H2 values left as they may represent a calibration problem
+###also cut rows with Feed == 0.01 because it likely represents
+"Subsetting high Drink, Feed values (drips during sampling)"
+TSE.data.clean <- TSE.data.clean[which(TSE.data$Box == 1),] %>%
+  filter(Feed >= 0 & Feed != 0.01 & Drink >= 0 & Feed <= cutoff.Feed &  Drink <= cutoff.Drink)
+
+###Clean for Rest of the Boxes 
+for(i in 2:8){ 
+  cutoff.Feed <- as.numeric(quantile(TSE.data$Feed[which(TSE.data$Box == i & TSE.data$Feed > 0.01)], 0.75, na.rm = TRUE) + (1.5*IQR(TSE.data$Feed[which(TSE.data$Box == i & TSE.data$Feed > 0.01)], na.rm = TRUE)))
+cutoff.Drink <- as.numeric(quantile(TSE.data$Drink[which(TSE.data$Box == i & TSE.data$Drink > 0)], 0.75, na.rm = TRUE) + (1.5*IQR(TSE.data$Drink[which(TSE.data$Box == i & TSE.data$Drink > 0)], na.rm = TRUE)))
+cutoff.dO2 <- as.numeric(quantile(TSE.data$dO2[which(TSE.data$Box == i & TSE.data$dO2 > 0)], 0.25, na.rm = TRUE) - (1.5*IQR(TSE.data$dO2[which(TSE.data$Box == i & TSE.data$dO2>0)], na.rm = TRUE)))
+cutoff.dCO2 <- as.numeric(quantile(TSE.data$dCO2[which(TSE.data$Box == i & TSE.data$dCO2> 0)], 0.25, na.rm = TRUE) - (1.5*IQR(TSE.data$dCO2[which(TSE.data$Box == i & TSE.data$dCO2 > 0)], na.rm = TRUE)))
+  
+TSE.data.clean.tmp <- TSE.data[which(TSE.data$Box == i),] %>%
+    filter(dO2 > 0 & dCO2 > 0 &
+    dO2 >= cutoff.dO2 & dCO2 >= cutoff.dCO2) %>%
+  filter(Feed >= 0 & Feed != 0.01 & Drink >= 0 & Feed <= cutoff.Feed &  Drink <= cutoff.Drink) 
+###join into TSE.data.clean
+TSE.data.clean <- full_join(TSE.data.clean,TSE.data.clean.tmp, by = NULL)}
+###Check for/filter biologically non-reasonable RER_no_BW values
+print(TSE.data.clean[which(TSE.data.clean$RER_no_BW > 1.2 | TSE.data.clean$RER_no_BW < 0.7),c("Date", "Box", "dO2", "dCO2", "RER_no_BW")])
+#View(TSE.data.clean[which(TSE.data.clean$RER_no_BW > 1.2 | TSE.data.clean$RER_no_BW < 0.7),c("Date", "Box", "dO2", "dCO2", "RER_no_BW")])
+TSE.data.clean <- filter(TSE.data.clean, RER_no_BW < 1.2, RER_no_BW > 0.7)
+
+"Subsetting day number data"
+###define not-in function
+'%!in%' <- function(x,y)!(x %in% y)
+###keep only days with >= 90% of max number of datapoints, note that this may result in discarding a day in the middle of the experiment 
+datapoints.day <- count(group_by(TSE.data.clean, Box, day.num))
+print(datapoints.day[which(datapoints.day$n < 0.8*(max(datapoints.day$n))),])
+###initialize
+TSE.data.clean.tmp.sum <- TSE.data.clean[which(TSE.data.clean$Box == 1),] %>%
+  filter(day.num %!in% datapoints.day$day.num[which(datapoints.day$Box == 1 & datapoints.day$n < 0.8*(max(datapoints.day$n)))])
+###complete
+for(i in 2:8){TSE.data.clean.tmp <- TSE.data.clean[which(TSE.data.clean$Box == i),] %>%
+  filter(day.num %!in% datapoints.day$day.num[which(datapoints.day$Box == i & datapoints.day$n < 0.8*(max(datapoints.day$n)))])
+###join into TSE.data.clean
+TSE.data.clean.tmp.sum <- full_join(TSE.data.clean.tmp.sum,TSE.data.clean.tmp, by = NULL)}
+TSE.data.clean <- TSE.data.clean.tmp.sum
+"Recalculate Cumulative values"
+TSE.data.clean <- TSE.data.clean %>%
+  group_by(Box) %>%
+  mutate(
+    Cum.Drink = cumsum(Drink),
+    Cum.Feed = cumsum(Feed)
+  )  
+
+TSE.data.clean <- TSE.data.clean %>%
+  group_by(Box, day.num) %>%
+  mutate(
+    daily.Drink = sum(Drink),
+    daily.Feed = sum(Feed)
+  )
+###Option for quick check for extreme values
+###View(TSE.data.clean[,c("Date","Box", "Feed", "Drink", "dO2", "dCO2", "RER_no_BW")])
+
+write.csv(file="Clean_phenomaster_Data
+          .csv", TSE.data.clean,row.names = F)
+```
+
+Checking clean new values
+```{r}
+colSums(is.na(TSE.data.clean))
+TSE.data.clean %>% count(Box)
+
+###making point, line plots
+for(i in 1:2){print(
+  ggplot(data = TSE.data.clean, aes(x = day.num, y = get(plot.names[i]), col = Box)) 
+  + ylab(plot.names[i]) 
+  + geom_point(size = 0.5)
+  + theme_bw())}
+
+for(i in 3:8){print(
+  ggplot(data = TSE.data.clean, aes(x = timepoint_clean_h, y = get(plot.names[i]), col = Box)) 
+  + ylab(plot.names[i]) 
+  + geom_line(size = 0.5) 
+  + theme_bw())}
+
+###overlay data
+ggplot(data=TSE.data.clean, aes(x=zt, y=RER_no_BW, col= Box)) +
+  geom_line(size=0.5) +
+  theme_bw()
+
+ggplot(data=TSE.data.clean, aes(x=zt, y=EE_no_BW, col= Box)) +
+  scale_x_continuous(name = "ZT", breaks = seq(0,24,6)) +
+  geom_line(size=0.5) +
+  theme_bw()
+
+```
+Testing clean dataset by taking overall cutoff values (with the current setup, this does not identify days that are unusually low in dO2 or dCO2 due to e.g. a suspected filter problem)
+```{r, eval = FALSE}
+###Setting cutoff values for whole dataset
+cutoff.Feed.oa <- as.numeric(quantile(TSE.data.clean$Feed[which(TSE.data.clean$Feed > 0.01)], 0.75, na.rm = TRUE) + (1.5*IQR(TSE.data.clean$Feed[which(TSE.data.clean$Feed > 0.01)], na.rm = TRUE)))
+cutoff.Drink.oa <- as.numeric(quantile(TSE.data.clean$Drink[which(TSE.data.clean$Drink > 0)], 0.75, na.rm = TRUE) + (1.5*IQR(TSE.data.clean$Drink[which(TSE.data.clean$Drink > 0)], na.rm = TRUE)))
+cutoff.dO2.oa <- as.numeric(quantile(TSE.data.clean$dO2[which(TSE.data.clean$dO2 > 0)], 0.25, na.rm = TRUE) - (1.5*IQR(TSE.data.clean$dO2[which(TSE.data.clean$dO2>0)], na.rm = TRUE)))
+cutoff.dCO2.oa <- as.numeric(quantile(TSE.data.clean$dCO2[which(TSE.data.clean$dCO2> 0)], 0.25, na.rm = TRUE) - (1.5*IQR(TSE.data.clean$dCO2[which(TSE.data.clean$dCO2 > 0)], na.rm = TRUE)))
+"Sub9setting extreme low VO2 or CO2 values (open cages during sampling)"
+TSE.data.clean.oa <- TSE.data.clean%>%
+  filter(dO2 > 0 & dCO2 > 0 &
+    dO2 >= cutoff.dO2 & dCO2 >= cutoff.dCO2)
+##Negative R.H2 values left as they may represent a calibration problem
+###also cut rows with Feed == 0.01 because it likely represents error
+"Subsetting high Drink, Feed values (drips during sampling)"
+TSE.data.clean.oa <- TSE.data.clean.oa %>%
+  filter(Feed >= 0 & Feed != 0.01 & Drink >= 0 & Feed <= cutoff.Feed &  Drink <= cutoff.Drink)
+
+###counting datapoints/day/mouse
+datapoints.day.oa <- count(group_by(TSE.data.clean.oa, Box, day.num))
+print(datapoints.day.oa[which(datapoints.day.oa$n < 0.8*(max(datapoints.day.oa$n))),])
+
+
+```
+Trying again with cutoff values excluding the box being tested (same story as previous chunk)
+```{r, eval = FALSE}
+###clean for Box 1
+###Setting cutoff values. This is necessary since using the formula directly in the filter function will not perform correct filtering for some reason
+cutoff.Feed <- as.numeric(quantile(TSE.data.clean$Feed[which(TSE.data.clean$Box != 1 & TSE.data.clean$Feed > 0.01)], 0.75, na.rm = TRUE) + (1.5*IQR(TSE.data.clean$Feed[which(TSE.data.clean$Box != 1 & TSE.data.clean$Feed > 0.01)], na.rm = TRUE)))
+cutoff.Drink <- as.numeric(quantile(TSE.data.clean$Drink[which(TSE.data.clean$Box != 1 & TSE.data.clean$Drink > 0)], 0.75, na.rm = TRUE) + (1.5*IQR(TSE.data.clean$Drink[which(TSE.data.clean$Box != 1 & TSE.data.clean$Drink > 0)], na.rm = TRUE)))
+cutoff.dO2 <- as.numeric(quantile(TSE.data.clean$dO2[which(TSE.data.clean$Box != 1 & TSE.data.clean$dO2 > 0)], 0.25, na.rm = TRUE) - (1.5*IQR(TSE.data.clean$dO2[which(TSE.data.clean$Box != 1 & TSE.data.clean$dO2>0)], na.rm = TRUE)))
+cutoff.dCO2 <- as.numeric(quantile(TSE.data.clean$dCO2[which(TSE.data.clean$Box != 1 & TSE.data.clean$dCO2> 0)], 0.25, na.rm = TRUE) - (1.5*IQR(TSE.data.clean$dCO2[which(TSE.data.clean$Box != 1 & TSE.data.clean$dCO2 > 0)], na.rm = TRUE)))
+"Sub9setting extreme low VO2 or CO2 values (open cages during sampling)"
+TSE.data.clean.oa <- TSE.data.clean[which(TSE.data.clean$Box != 1),] %>%
+  filter(dO2 > 0 & dCO2 > 0 &
+    dO2 >= cutoff.dO2 & dCO2 >= cutoff.dCO2)
+##Negative R.H2 values left as they may represent a calibration problem
+###also cut rows with Feed == 0.01 because it likely represents
+"Subsetting high Drink, Feed values (drips during sampling)"
+TSE.data.clean.oa <- TSE.data.clean.oa[which(TSE.data.clean$Box != 1),] %>%
+  filter(Feed >= 0 & Feed != 0.01 & Drink >= 0 & Feed <= cutoff.Feed &  Drink <= cutoff.Drink)
+
+###Clean for Rest of the Boxes 
+for(i in 2:8){ 
+  cutoff.Feed <- as.numeric(quantile(TSE.data.clean$Feed[which(TSE.data.clean$Box != i & TSE.data.clean$Feed > 0.01)], 0.75, na.rm = TRUE) + (1.5*IQR(TSE.data.clean$Feed[which(TSE.data.clean$Box != i & TSE.data.clean$Feed > 0.01)], na.rm = TRUE)))
+cutoff.Drink <- as.numeric(quantile(TSE.data.clean$Drink[which(TSE.data.clean$Box != i & TSE.data.clean$Drink > 0)], 0.75, na.rm = TRUE) + (1.5*IQR(TSE.data.clean$Drink[which(TSE.data.clean$Box != i & TSE.data.clean$Drink > 0)], na.rm = TRUE)))
+cutoff.dO2 <- as.numeric(quantile(TSE.data.clean$dO2[which(TSE.data.clean$Box != i & TSE.data.clean$dO2 > 0)], 0.25, na.rm = TRUE) - (1.5*IQR(TSE.data.clean$dO2[which(TSE.data.clean$Box != i & TSE.data.clean$dO2>0)], na.rm = TRUE)))
+cutoff.dCO2 <- as.numeric(quantile(TSE.data.clean$dCO2[which(TSE.data.clean$Box != i & TSE.data.clean$dCO2> 0)], 0.25, na.rm = TRUE) - (1.5*IQR(TSE.data.clean$dCO2[which(TSE.data.clean$Box != i & TSE.data.clean$dCO2 > 0)], na.rm = TRUE)))
+  
+TSE.data.clean.tmp.oa <- TSE.data.clean[which(TSE.data.clean$Box == i),] %>%
+    filter(dO2 > 0 & dCO2 > 0 &
+    dO2 >= cutoff.dO2 & dCO2 >= cutoff.dCO2) %>%
+  filter(Feed >= 0 & Feed != 0.01 & Drink >= 0 & Feed <= cutoff.Feed &  Drink <= cutoff.Drink) 
+###join into TSE.data.clean
+TSE.data.clean.oa <- full_join(TSE.data.clean.oa,TSE.data.clean.tmp.oa, by = NULL)}
+"Subsetting day number data"
+###keep only days with >= 90% of max number of datapoints, note that this may result in discarding a day in the middle of the experiment 
+datapoints.day.oa <- count(group_by(TSE.data.clean.oa, Box, day.num))
+print(datapoints.day.oa[which(datapoints.day.oa$n < 0.8*(max(datapoints.day.oa$n))),])
+
+```
+Filter Boxes with systemic error not detected by algorithm above
+```{r, eval = TRUE}
+###Warning messages
+print("Before proceeding, check updated exploratory graphs for sketchy patterns")
+print("In case manual selection to exclude data is necessary, check event log for explanation")
+
+### exclude specified boxes/Days
+exclude_box <- eval(parse(text = readline("boxes to exclude(as vector): ")))
+exclude_day <- eval(parse(text = readline("days to exclude from said boxes(as list: list(c(from box1), c(from box2),...): ")))
+
+if(length(exclude_box) > 0 & length(exclude_day) > 0){
+###identify rows to be cut
+exclude_row <- c()
+
+for(i in 1:length(exclude_box)){
+exclude_box_row <- which(TSE.data.clean$Box %in% exclude_box[i])
+exclude_day_row <- which(TSE.data.clean$day.num %in% unlist(exclude_day[i]))
+exclude_row_tmp <- intersect(exclude_box_row,exclude_day_row)
+exclude_row <- append(exclude_row,exclude_row_tmp)}
+
+###Update dataset
+TSE.data.clean <- TSE.data.clean[-exclude_row,]}
+```
+Writing a clean and master dataset into csv
+
+```{r, eval = FALSE}
+###add experiment id for later master dataset analysis
+TSE.data.clean <- TSE.data.clean %>% mutate(experiment_id = input_name)
+
+#write.csv(TSE.data.clean, paste(input_name,"_clean.csv",sep = ""), row.names = FALSE)
+###option to start master dataset; make sure to disable the rest of this chunk to avoid duplication
+#write.csv(TSE.data.clean, "../master_clean.csv", row.names = FALSE)
+
+###load master dataset, add new set
+
+master.clean <- read_delim("../master_clean.csv",  delim = ",", col_names = TRUE, col_types = cols(Date = col_date(format = "%Y-%m-%d"), Time = col_time(format = "%H:%M:%S"), Box = col_factor(levels=NULL, ordered = FALSE)), locale = locale(decimal_mark = "."))
+                      
+master.clean <- bind_rows(master.clean,TSE.data.clean)
+write.csv(master.clean,file = "../master_clean.csv", row.names = FALSE)
+```
+
+UPDATE Specific data analysis
+
+```{r, eval = FALSE}
+
+##create new dataset ###include variables now added from add.var
+daily.energy <- TSE.data.clean %>%
+  group_by(Box, mouseID,day.num, microbiota, age_wks, av_wg, cecum_g, iBAT_mg, ingWAT_mg, visWAT_mg) %>%
+  summarise(
+    daily.Drink = sum(Drink),
+    daily.Feed = sum(Feed),
+    DEE = as.numeric(AUC(zt, EE_no_BW, method = "trapezoid"))
+    )
+
+daily.energy<- daily.energy %>%  
+  mutate(lean.proxy = av_wg - ((iBAT_mg+ingWAT_mg+visWAT_mg)/1000) - cecum_g)
+
+write.csv(daily.energy, paste("DEE_",input_name,".csv",sep = ""), row.names = FALSE)
+###write full/clean dataset without cleanup into .csv for cleanup quality control. Boxes to exclude need to be excluded again because a single row per excluded value (with Box = exclude; rest = NA) is added (possibly while looping the filtering processes). This might not be necessary anymore with the new setup (exclude boxes at very end)
+###cut specified datapoints
+###for(i in 1:length(exclude_box)){TSE.data<- TSE.data %>% FIX THIS
+  ###filter(Box %!in% exclude_box[i] & day %!in% exclude_day[i])}
+#write.csv(TSE.data, paste(input_name,"_full.csv",sep = ""), row.names = FALSE)
+#write.csv(TSE.data.clean, paste(input_name,"_clean.csv",sep = ""), row.names = FALSE)
+```
+
